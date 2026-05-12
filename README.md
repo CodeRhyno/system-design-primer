@@ -988,6 +988,117 @@ Benchmarking and profiling might point you to the following optimizations.
 * [How do null values affect performance?](http://stackoverflow.com/questions/1017239/how-do-null-values-affect-performance-in-a-database-search)
 * [Slow query log](http://dev.mysql.com/doc/refman/5.7/en/slow-query-log.html)
 
+### Dealing with contention
+
+**Contention** occurs when multiple processes compete for the same resource at the same time (for example, the last concert ticket, a flash-sale SKU, or an auction bid).  Without coordination you risk race conditions, double bookings, and inconsistent state.  The fix is usually a progression: use **atomic transactions** on one database, add **pessimistic** or **optimistic** concurrency control when reads and writes interleave, then—only when data is split across systems—reach for **distributed transactions**, **distributed locks**, or **sagas**, each with different consistency and availability tradeoffs. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+#### The problem
+
+Classic **read–check–write** races happen when two clients observe the same state, both decide the operation is allowed, and both commit.  Each transaction can be **atomic** on its own, yet the outcome is wrong because of **isolation**: there is a window between reading state and writing an update where another transaction changes the world.  That window is tiny in memory but much larger over the network; at scale, many concurrent users turn a small race into frequent corruption unless you add explicit synchronization. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+```mermaid
+sequenceDiagram
+    participant Alice as Client A
+    participant DB as Database
+    participant Bob as Client B
+    Alice->>DB: Read seats = 1
+    Bob->>DB: Read seats = 1
+    Alice->>DB: Check seats >= 1 (true)
+    Bob->>DB: Check seats >= 1 (true)
+    Alice->>DB: Update seats = 0, charge
+    Bob->>DB: Update seats = -1, charge
+    Note over Alice,Bob: Both believed one seat existed; isolation gap between read and write
+```
+
+#### Single-node approaches
+
+When all contended rows live in **one** database, prefer the simplest mechanism that preserves invariants.
+
+##### Transactions and atomicity
+
+A **transaction** groups operations so they **commit** or **rollback** together—useful so you never reserve inventory without creating a ticket row (or vice versa).  Still guard business rules: an `UPDATE ... WHERE seats > 0` that matches **zero** rows does not necessarily fail the transaction; pair it with patterns such as **`UPDATE ... RETURNING`** (or check `rows_affected`) before inserting dependent rows so you never create a ticket when no seat was decremented. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+##### Pessimistic locking
+
+**Pessimistic** locking assumes conflicts will happen: take a lock before reading critical state.  In SQL, `SELECT ... FOR UPDATE` acquires an exclusive row lock so a second transaction blocks on the read until the first completes—serialization by waiting, not by abort/retry.  Lock **few** rows for **short** durations; long transactions or table locks destroy throughput. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+##### Isolation levels
+
+Isolation levels control what concurrent transactions may see: **`READ UNCOMMITTED`**, **`READ COMMITTED`** (PostgreSQL default), **`REPEATABLE READ`** (MySQL default for InnoDB), and **`SERIALIZABLE`**.  Under **`READ COMMITTED`**, the double-sale pattern can still occur because both transactions see “one seat left.”  **`SERIALIZABLE`** makes executions equivalent to running one-at-a-time; the database may **abort** a conflicting transaction so the application must **retry**—stronger safety, higher cost than targeted row locks.  Behavior differs by engine; do not assume `REPEATABLE READ` alone fixes every lost-update scenario without testing your dialect. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+##### Optimistic concurrency control (OCC)
+
+**Optimistic** concurrency assumes conflicts are rare: read a **version** (dedicated column or a naturally monotonic field), then `UPDATE ... WHERE id = ? AND version = ?` and increment the version.  A stale version updates **zero** rows without raising an error—application code must detect `rows_affected == 0`, **rollback or retry** with fresh state.  Using a mutable business field as the version can invite the **ABA** problem (value goes A→B→A while logic assumes “unchanged”); a dedicated version column is the usual safe default.  OCC shines when collisions are uncommon (typical e-commerce skew). <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+```mermaid
+flowchart LR
+  subgraph pessimistic["Pessimistic"]
+    A1[Lock row] --> A2[Read + write]
+    A2 --> A3[Commit releases lock]
+  end
+  subgraph optimistic["Optimistic"]
+    B1[Read version] --> B2[Write WHERE version matches]
+    B2 --> B3{Rows updated?}
+    B3 -->|0| B4[Retry / fail]
+    B3 -->|1| B5[Commit]
+  end
+```
+
+#### Multiple-node coordination
+
+When contended data spans **different** databases (for example, sharded accounts), prefer redesign so hot paths stay on **one** shard whenever possible.  If you must coordinate across nodes:
+
+* **Two-phase commit (2PC)** – a coordinator runs **prepare** then **commit**; participants hold locks during prepare.  The coordinator should **persist its decision log** before telling databases to commit or abort.  2PC gives **atomicity** across systems but is **latency-heavy** and can **block** if the coordinator disappears after prepare. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+* **Distributed locks** – serialize work with a lock service (**Redis** with `SET NX` + TTL, **ZooKeeper/etcd**, or lock rows in a shared DB).  Simpler than full 2PC but watch **TTL expiry while work continues** (GC pauses, slow handlers) and lock **contention** becoming a bottleneck.  Product flows often add **reservations** (seat “on hold,” cart hold, driver “pending”) so users never enter a blind race. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+* **Sagas** – a **sequence** of local transactions with **compensating** actions (debit Alice, then credit Bob; if step two fails, credit Alice back).  No long-lived locks across the network like 2PC, but the system is **temporarily inconsistent** between steps—design reads and UX for intermediate states and use a **durable orchestrator** (workflow engine or state table) to resume after crashes. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+```mermaid
+sequenceDiagram
+    participant C as Coordinator
+    participant DBa as Database A
+    participant DBb as Database B
+    C->>DBa: Prepare (hold locks)
+    C->>DBb: Prepare (hold locks)
+    alt all prepared
+        C->>DBa: Commit
+        C->>DBb: Commit
+    else any prepare fails
+        C->>DBa: Abort
+        C->>DBb: Abort
+    end
+```
+
+#### Choosing an approach
+
+* **Single database, high contention on a row** – pessimistic row locks (`FOR UPDATE`); predictable and easy to reason about under worst-case load. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+* **Single database, low contention** – optimistic versioning; fewer blocks, retries only on conflict. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+* **Multiple databases, true cross-system atomicity** – 2PC when you truly need it; **sagas** when you can accept brief inconsistency and want resilience. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+* **User-visible races** – distributed locks plus **reservation** states to keep customers out of blind contention. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+When in doubt in an interview, starting with **pessimistic locking in one database** is a defensible default; you can refine toward OCC or distributed patterns as constraints become clear. <sup><a href=https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention>1</a></sup>
+
+<p align="center">
+  <i>Excalidraw diagram (overview): <a href="images/dealing-with-contention-overview.excalidraw">images/dealing-with-contention-overview.excalidraw</a> — open from the Excalidraw app or <a href="https://excalidraw.com">excalidraw.com</a> (Open).</i>
+</p>
+
+<p align="center">
+  <i>Excalidraw diagram (decision sketch): <a href="images/dealing-with-contention-decision.excalidraw">images/dealing-with-contention-decision.excalidraw</a></i>
+</p>
+
+##### Disadvantage(s): dealing with contention
+
+* Stronger isolation (`SERIALIZABLE`) and distributed protocols increase **latency**, **abort/retry** rates, or **operational** burden.
+* Locks (local or distributed) can become **hotspots**; TTL locks risk **split brain** if expiry is mis-tuned.
+* Sagas require explicit **compensation** and **orchestration**; temporary inconsistency must be visible to the product and support teams.
+
+##### Source(s) and further reading: dealing with contention
+
+* [Hello Interview: Dealing with contention pattern](https://www.hellointerview.com/learn/system-design/patterns/dealing-with-contention)
+* [Database transaction](https://en.wikipedia.org/wiki/Database_transaction)
+* [Optimistic concurrency control](https://en.wikipedia.org/wiki/Optimistic_concurrency_control)
+* [Two-phase commit protocol](https://en.wikipedia.org/wiki/Two-phase_commit_protocol)
+* [Saga pattern](https://microservices.io/patterns/data/saga.html)
+
 ### NoSQL
 
 NoSQL is a collection of data items represented in a **key-value store**, **document store**, **wide column store**, or a **graph database**.  Data is denormalized, and joins are generally done in the application code.  Most NoSQL stores lack true ACID transactions and favor [eventual consistency](#eventual-consistency).
@@ -1636,7 +1747,7 @@ Handy metrics based on numbers above:
 
 #### Latency numbers visualized
 
-![](https://camo.githubusercontent.com/77f72259e1eb58596b564d1ad823af1853bc60a3/687474703a2f2f692e696d6775722e636f6d2f6b307431652e706e67)
+![](images/k0t1e.png)
 
 #### Source(s) and further reading
 
